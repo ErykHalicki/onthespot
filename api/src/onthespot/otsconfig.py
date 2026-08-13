@@ -66,7 +66,7 @@ class Config:
         If any step fails, appropriate fallback mechanisms are used to ensure that the application can still run.
         """
         config_root = config_dir()
-        
+
         self.__cfg_path = os.path.join(config_root, "otsconfig.json")
         self.__default_cfg_path = os.path.join(
             os.path.dirname(__file__), "otsconfig_default.json"
