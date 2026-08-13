@@ -305,6 +305,32 @@ def soundcloud_get_playlist_data(token, item_id):
     return playlist_name, playlist_by, track_ids
 
 
+def soundcloud_get_tracks_basic(token, track_ids):
+    """Fetch title/uploader/permalink for many tracks in one call, without the
+    album-page scraping soundcloud_get_track_metadata does. Used to cheaply
+    identify playlist tracks (e.g. for local-duplicate checks) before
+    committing to a full per-track metadata fetch at download time."""
+    if not track_ids:
+        return {}
+
+    params = {}
+    params["client_id"] = token["client_id"]
+    params["app_version"] = token["app_version"]
+    params["app_locale"] = token["app_locale"]
+    params["ids"] = ",".join(str(track_id) for track_id in track_ids)
+
+    tracks = make_call(f"{BASE_URL}/tracks", headers=headers, params=params)
+
+    result = {}
+    for track in tracks:
+        result[str(track["id"])] = {
+            "title": track.get("title", ""),
+            "artist": track.get("user", {}).get("username", ""),
+            "permalink_url": track.get("permalink_url", ""),
+        }
+    return result
+
+
 def soundcloud_get_track_metadata(token, item_id):
     params = {}
     params["client_id"] = token["client_id"]

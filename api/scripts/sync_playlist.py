@@ -3,7 +3,7 @@
 sync_playlist.py
 ~~~~~~~~~~~~~~~~~
 
-Sync a Spotify playlist to a local directory using the OnTheSpot v2 backend,
+Sync a Spotify or SoundCloud playlist to a local directory using the OnTheSpot v2 backend,
 skipping tracks that already exist on disk (matched by embedded ID3 tags,
 with a filename-based fallback for untagged files).
 
@@ -26,6 +26,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from mutagen import File as MutagenFile  # noqa: E402
 
 from onthespot.accounts import FillAccountPool, get_account_token  # noqa: E402
+from onthespot.api.soundcloud import (  # noqa: E402
+    soundcloud_get_playlist_data,
+    soundcloud_get_tracks_basic,
+    soundcloud_parse_url,
+)
 from onthespot.api.spotify import (  # noqa: E402
     spotify_get_playlist_data,
     spotify_get_playlist_items,
@@ -230,11 +235,20 @@ def main():
     playlist_url, target_dir = args
     target_dir = os.path.abspath(target_dir)
 
-    m = re.search(r"playlist/([a-zA-Z0-9]+)", playlist_url)
-    if not m:
-        print("Could not find a playlist ID in the given URL.")
+    if "soundcloud.com" in playlist_url:
+        service = "soundcloud"
+    elif "spotify.com" in playlist_url:
+        service = "spotify"
+    else:
+        print("Unrecognized playlist URL (expected a spotify.com or soundcloud.com link).")
         sys.exit(1)
-    playlist_id = m.group(1)
+
+    if service == "spotify":
+        m = re.search(r"playlist/([a-zA-Z0-9]+)", playlist_url)
+        if not m:
+            print("Could not find a playlist ID in the given URL.")
+            sys.exit(1)
+        playlist_id = m.group(1)
 
     os.makedirs(target_dir, exist_ok=True)
     config.set("audio_download_path", target_dir)
@@ -252,45 +266,77 @@ def main():
     account_pool_loader.start()
     account_pool_loader.thread.join()
 
-    token = get_account_token("spotify")
+    token = get_account_token(service)
     if token is None:
-        print("No active Spotify account/session available. Aborting.")
+        print(f"No active {service.capitalize()} account/session available. Aborting.")
         sys.exit(1)
 
-    print(f"Fetching playlist: {playlist_id}")
-    playlist_name, playlist_by = spotify_get_playlist_data(token, playlist_id)
-    items = spotify_get_playlist_items(token, playlist_id)
-    print(f"Playlist '{playlist_name}' by {playlist_by}: {len(items)} items")
+    # candidates: (item_id, track_name, artists, index, item_url, added_at)
+    # added_at is "" when the service doesn't expose a per-track added date
+    # (SoundCloud), which disables the --added-after fast path for it below.
+    candidates = []
+
+    if service == "spotify":
+        print(f"Fetching playlist: {playlist_id}")
+        playlist_name, playlist_by = spotify_get_playlist_data(token, playlist_id)
+        items = spotify_get_playlist_items(token, playlist_id)
+        print(f"Playlist '{playlist_name}' by {playlist_by}: {len(items)} items")
+
+        for index, item in enumerate(items):
+            track = item.get("track")
+            if not track or not track.get("id"):
+                continue
+            track_id = track["id"]
+            track_name = track.get("name", "")
+            artists = [a.get("name", "") for a in track.get("artists", [])]
+            item_url = f"https://open.spotify.com/track/{track_id}"
+            candidates.append((track_id, track_name, artists, index, item_url, item.get("added_at", "")))
+    else:
+        print(f"Resolving playlist: {playlist_url}")
+        try:
+            item_type, item_id = soundcloud_parse_url(playlist_url, token)
+        except Exception as e:
+            print(f"Failed to resolve SoundCloud URL: {e}")
+            print("If this is a private/unlisted playlist, make sure a SoundCloud "
+                  "account with a valid OAuth token (not just the public client) "
+                  "is configured and active in onthespot.")
+            sys.exit(1)
+        if item_type not in ("playlist", "album"):
+            print(f"URL did not resolve to a SoundCloud playlist/album (got '{item_type}').")
+            sys.exit(1)
+        playlist_name, playlist_by, track_ids = soundcloud_get_playlist_data(token, item_id)
+        print(f"Playlist '{playlist_name}' by {playlist_by}: {len(track_ids)} items")
+
+        basics = soundcloud_get_tracks_basic(token, track_ids)
+        for index, track_id in enumerate(track_ids):
+            info = basics.get(str(track_id), {})
+            track_name = info.get("title", "")
+            artist = info.get("artist", "")
+            artists = [artist] if artist else []
+            item_url = info.get("permalink_url") or f"https://soundcloud.com/tracks/{track_id}"
+            candidates.append((track_id, track_name, artists, index, item_url, ""))
 
     queued = []
     skipped = []
     too_old = 0
 
-    for index, item in enumerate(items):
-        track = item.get("track")
-        if not track or not track.get("id"):
-            continue
-
-        if added_after and item.get("added_at", "") <= added_after:
+    for track_id, track_name, artists, index, item_url, added_at in candidates:
+        if added_after and added_at and added_at <= added_after:
             too_old += 1
             continue
-
-        track_id = track["id"]
-        track_name = track.get("name", "")
-        artists = [a.get("name", "") for a in track.get("artists", [])]
 
         # When --added-after already scopes the candidate set precisely, skip
         # the fuzzy pre-filter and let every candidate go through the pipeline -
         # the downloader's own exact-filename check reports "Already Exists"
         # (without re-downloading) and that status still gets manifested,
         # whereas a fuzzy pre-filter skip here never enters the queue at all.
-        if not added_after:
+        if not (added_after and added_at):
             reason = already_have(track_name, artists, title_artists, filename_titles)
             if reason:
                 skipped.append((track_name, artists, reason))
                 continue
 
-        queued.append((track_id, track_name, artists, index))
+        queued.append((track_id, track_name, artists, index, item_url))
 
     if added_after:
         print(f"\n{too_old} tracks added on/before {added_after} were excluded outright.")
@@ -298,7 +344,7 @@ def main():
 
     if dry_run:
         print("=== DRY RUN: tracks that WOULD be downloaded ===")
-        for _, name, artists, _ in queued:
+        for _, name, artists, _, _ in queued:
             print(f"  NEW: {', '.join(artists)} - {name}")
         print("\n=== sample of tracks matched as already-local ===")
         for name, artists, reason in skipped[:15]:
@@ -322,13 +368,13 @@ def main():
         downloadworker.start()
 
     queued_with_ids = []
-    for track_id, track_name, artists, index in queued:
+    for track_id, track_name, artists, index, item_url in queued:
         local_id = format_local_id(track_id)
         queued_with_ids.append((local_id, track_name, artists))
         pending.put_nowait(
             {
                 "local_id": local_id,
-                "item_service": "spotify",
+                "item_service": service,
                 "item_type": "track",
                 "item_id": track_id,
                 "parent_category": "playlist",
@@ -337,7 +383,7 @@ def main():
                 "playlist_number": str(index + 1),
                 "available": True,
                 "item_status": ItemStatus.WAITING,
-                "item_url": f"https://open.spotify.com/track/{track_id}",
+                "item_url": item_url,
             }
         )
     queued = queued_with_ids
