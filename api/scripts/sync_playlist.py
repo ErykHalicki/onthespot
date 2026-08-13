@@ -87,16 +87,23 @@ def split_artists(artist_field: str) -> set[str]:
     return {normalize(p) for p in parts if normalize(p)}
 
 
+LEADING_BRACKET_CAPTURE_RE = re.compile(r"^\s*[\[\(]([^\]\)]*)[\]\)]\s*[-]?\s*")
+
+
 def build_existing_index(target_dir: str):
     """Scan target_dir for audio files and index them by title.
 
     title_artists: normalized title -> set of normalized artist tokens seen
                    tagged against that title (empty set if untagged).
-    filename_titles: normalized title-guesses derived from filenames, used as
-                      a fallback for files with missing/unreadable tags.
+    filename_titles: normalized title-guess -> set of normalized artist
+                      tokens inferred for it (from the file's own tags, or
+                      from a "[Artist]-Title" filename prefix; empty set if
+                      no artist could be inferred at all). Used as a fallback
+                      for files with missing/unreadable tags, and to weed out
+                      titles that only coincidentally match.
     """
     title_artists: dict[str, set[str]] = {}
-    filename_titles: set[str] = set()
+    filename_titles: dict[str, set[str]] = {}
     scanned = 0
     tagged = 0
 
@@ -109,31 +116,47 @@ def build_existing_index(target_dir: str):
             path = os.path.join(root, fname)
             stem = os.path.splitext(fname)[0]
 
-            # Filename fallback candidates: full stem, stem with a leading
-            # "[Artist] " prefix stripped, and every individual " - "
-            # delimited segment (titles can land in any position, e.g.
-            # "Artist - Title (Remix) - HQ!").
-            filename_titles.add(normalize(stem))
-            stripped = LEADING_BRACKET_RE.sub("", stem)
-            filename_titles.add(normalize(stripped))
-            for segment in stripped.split(" - "):
-                norm_segment = normalize(segment)
-                if norm_segment and norm_segment not in {"hq", "hd", "official", "audio", "video"}:
-                    filename_titles.add(norm_segment)
+            # Artist hint for this file's filename candidates: prefer the
+            # file's own tag (most reliable), else a leading "[Artist]-"
+            # filename prefix, else unknown (empty set = wildcard match).
+            bracket_match = LEADING_BRACKET_CAPTURE_RE.match(stem)
+            file_artists = split_artists(bracket_match.group(1)) if bracket_match else set()
 
             try:
                 audio = MutagenFile(path, easy=True)
-                if audio is None or not audio.tags:
-                    continue
-                title = (audio.tags.get("title") or [""])[0]
-                artist = (audio.tags.get("artist") or [""])[0]
+                tags = audio.tags if audio else None
+            except Exception:
+                tags = None
+
+            title = ""
+            if tags:
+                title = (tags.get("title") or [""])[0]
+                artist = (tags.get("artist") or [""])[0]
+                if artist:
+                    file_artists = split_artists(artist)
                 if title:
                     tagged += 1
                     norm_title = normalize(title)
                     title_artists.setdefault(norm_title, set())
-                    title_artists[norm_title] |= split_artists(artist)
-            except Exception:
-                continue
+                    title_artists[norm_title] |= file_artists
+
+            # Filename fallback candidates: full stem, stem with a leading
+            # "[Artist] " prefix stripped, and every individual " - "
+            # delimited segment (titles can land in any position, e.g.
+            # "Artist - Title (Remix) - HQ!"). All share this file's artist
+            # hint (if any) so an unrelated song with a similar title isn't
+            # mistaken for a match.
+            stripped = LEADING_BRACKET_RE.sub("", stem)
+            candidates = {normalize(stem), normalize(stripped)}
+            for segment in stripped.split(" - "):
+                norm_segment = normalize(segment)
+                if norm_segment and norm_segment not in {"hq", "hd", "official", "audio", "video"}:
+                    candidates.add(norm_segment)
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                filename_titles.setdefault(candidate, set())
+                filename_titles[candidate] |= file_artists
 
     return title_artists, filename_titles, scanned, tagged
 
@@ -169,8 +192,10 @@ def already_have(track_name: str, artists: list[str], title_artists, filename_ti
         # Title matched but tagged artist(s) look unrelated - likely a
         # different song with the same title, don't treat as a duplicate.
 
-    for candidate in filename_titles:
-        if _fuzzy_contains(norm_title, candidate):
+    for candidate, candidate_artists in filename_titles.items():
+        if not _fuzzy_contains(norm_title, candidate):
+            continue
+        if not candidate_artists or candidate_artists & norm_track_artists:
             return f"filename match ({track_name})"
 
     return None
