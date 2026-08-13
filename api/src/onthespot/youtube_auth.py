@@ -182,6 +182,6 @@ def youtube_ydl_options() -> dict:
     return {}
 
 
-def is_youtube_url(value: str) -> bool:
-    normalized = (value or "").lower()
+def is_youtube_url(value) -> bool:
+    normalized = str(value or "").lower()
     return any(host in normalized for host in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
